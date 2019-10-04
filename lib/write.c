@@ -241,7 +241,7 @@ set_unused_block(hive_h *h, size_t offset)
  * > 0 : offset of new block
  * 0   : error (errno set)
  */
-static size_t
+size_t
 allocate_block (hive_h *h, size_t seg_len, const char id[2])
 {
   bool new_block = true;
@@ -337,7 +337,11 @@ static void
 mark_block_unused (hive_h *h, size_t offset)
 {
   assert (h->writable);
-  assert (IS_VALID_BLOCK (h, offset));
+
+  if (!IS_VALID_BLOCK(h, offset)) {
+    //Duplicated vks found in nk, ignore double deletion request
+    return;
+  }
 
   DEBUG (2, "marking 0x%zx unused", offset);
 
