@@ -397,6 +397,22 @@ stored in C<node>.  If the key does not already exist, then a
 new key is added.  Key matching is case insensitive.
 
 C<node> is the node to modify.";
+
+  "free_bytes", (RSize, [AHive]),
+    "calculate free bytes",
+    "\
+Hivex free bytes.";
+
+  "used_bytes", (RSize, [AHive]),
+    "calculate hive used bytes",
+    "\
+Hivex used bytes.";
+
+  "defragment", (RInt32, [AHive; AString "name"]),
+    "defragment hives",
+    "\
+Allocate free bytes & defragment.";
+
 ]
 
 let f_len_exists n =
@@ -683,7 +699,7 @@ let check_functions () =
   (* Check short descriptions. *)
   List.iter (
     fun (name, _, shortdesc, _) ->
-      if shortdesc.[0] <> Char.lowercase shortdesc.[0] then
+      if shortdesc.[0] <> Char.lowercase_ascii shortdesc.[0] then
         failwithf "short description of %s should begin with lowercase." name;
       let c = shortdesc.[String.length shortdesc-1] in
       if c = '\n' || c = '.' then
@@ -910,6 +926,8 @@ struct hivex_visitor {
 
 extern int hivex_visit (hive_h *h, const struct hivex_visitor *visitor, size_t len, void *opaque, int flags);
 extern int hivex_visit_node (hive_h *h, hive_node_h node, const struct hivex_visitor *visitor, size_t len, void *opaque, int flags);
+extern int hivex_node_add_children(hive_h *h, hive_node_h parent, const char **names, int num_names);
+extern int hivex_node_delete_children(hive_h *h, hive_node_h* nodes, int num_nodes);
 
 ";
 
@@ -1513,7 +1531,9 @@ and generate_linker_script () =
 
   let globals = [
     "hivex_visit";
-    "hivex_visit_node"
+    "hivex_visit_node";
+    "hivex_node_add_children";
+    "hivex_node_delete_children"
   ] in
 
   let functions =
@@ -2187,7 +2207,7 @@ XSLoader::load ('Win::Hivex');
 
   List.iter (
     fun (_, flag, _) ->
-      pr "\n                        [%s => 1,]" (String.lowercase flag)
+      pr "\n                        [%s => 1,]" (String.lowercase_ascii flag)
   ) open_flags;
 
   pr ")
@@ -2217,7 +2237,7 @@ sub open {
   List.iter (
     fun (n, flag, description) ->
       pr "  # %s\n" description;
-      pr "  $flags += %d if $flags{%s};\n" n (String.lowercase flag)
+      pr "  $flags += %d if $flags{%s};\n" n (String.lowercase_ascii flag)
   ) open_flags;
 
   pr "\
@@ -2957,6 +2977,84 @@ get_values (PyObject *v, py_set_values *ret)
 }
 
 static PyObject *
+py_hivex_node_add_children (PyObject *self, PyObject *args)
+{
+  PyObject *py_r;
+  hive_node_h r;
+  hive_h *h;
+  PyObject *py_h;
+  long parent;
+  PyObject *names_obj;
+  int num_children = 0;
+  char const **names = NULL;
+
+  if (!PyArg_ParseTuple (args, (char *) \"OlO:hivex_node_add_children\", &py_h, &parent, &names_obj))
+    return NULL;
+  h = get_handle (py_h);
+  PyObject *iter = PyObject_GetIter(names_obj);
+  if (!iter) { return NULL; } //Not a list?
+  for(;;) {
+    PyObject *next = PyIter_Next(iter);
+    if (!next) break;
+    if (!PyUnicode_Check(next)){ return NULL; } // Non unicode string passed?
+    num_children++;
+    names = realloc (names, sizeof(char*) * num_children);
+    const char* name = PyUnicode_AsUTF8(next);
+    names[num_children-1] = name;
+  }
+  r = hivex_node_add_children (h, parent, names);
+  //TODO: What else needs to be freed?
+  free(names);
+  free(iter);
+  if (r == -1) {
+    PyErr_SetString (PyExc_RuntimeError,
+                     strerror (errno));
+    return NULL;
+  }
+  Py_INCREF (Py_None);
+  py_r = Py_None;
+  return py_r;
+}
+
+static PyObject *
+py_hivex_node_delete_children (PyObject *self, PyObject *args)
+{
+  PyObject *py_r;
+  int r;
+  hive_h *h;
+  PyObject *py_h;
+  PyObject *nodes_obj;
+  unsigned long *nodes = NULL;
+  int num_nodes = 0;
+
+  if (!PyArg_ParseTuple (args, (char *) \"OO:hivex_node_delete_children\", &py_h, &nodes_obj))
+    return NULL;
+  h = get_handle (py_h);
+  PyObject *iter = PyObject_GetIter(nodes_obj);
+  if (!iter) { return NULL; } //Not a list?
+  for(;;) {
+    PyObject *next = PyIter_Next(iter);
+    if (!next) break;
+    if (!PyLong_Check(next)){ return NULL; } // Non unicode string passed?
+    num_nodes++;
+    nodes = realloc (nodes, sizeof(long) * num_nodes);
+    long node = PyLong_AsLong(next);
+    nodes[num_nodes-1] = node;
+  }
+  r = hivex_node_delete_children (h, nodes, num_nodes);
+  //TODO: What to free?
+  if (r == -1) {
+    PyErr_SetString (PyExc_RuntimeError,
+                     strerror (errno));
+    return NULL;
+  }
+ 
+  Py_INCREF (Py_None);
+  py_r = Py_None;
+  return py_r;
+}
+ 
+static PyObject *
 put_string_list (char * const * const argv)
 {
   PyObject *list;
@@ -3260,6 +3358,8 @@ put_val_type (char *val, size_t len, hive_type t)
       pr "  { (char *) \"%s\", py_hivex_%s, METH_VARARGS, NULL },\n"
         name name
   ) functions;
+  pr "  { (char *) \"node_add_children\", py_hivex_node_add_children, METH_VARARGS, NULL },\n";
+  pr "  { (char *) \"node_delete_children\", py_hivex_node_delete_children, METH_VARARGS, NULL },\n";
   pr "  { NULL, NULL, 0, NULL }\n";
   pr "};\n";
   pr "\n";
@@ -3338,7 +3438,7 @@ class Hivex(object):
     def __init__ (self, filename";
 
   List.iter (
-    fun (_, flag, _) -> pr ", %s = False" (String.lowercase flag)
+    fun (_, flag, _) -> pr ", %s = False" (String.lowercase_ascii flag)
   ) open_flags;
 
   pr "):
@@ -3349,7 +3449,7 @@ class Hivex(object):
   List.iter (
     fun (n, flag, description) ->
       pr "        # %s\n" description;
-      pr "        if %s: flags += %d\n" (String.lowercase flag) n
+      pr "        if %s: flags += %d\n" (String.lowercase_ascii flag) n
   ) open_flags;
 
   pr "        self._o = libhivexmod.open (filename, flags)
@@ -3580,7 +3680,7 @@ get_values (VALUE valuesv, size_t *nr_values)
           List.iter (
             fun (n, flag, _) ->
               pr "  if (RTEST (rb_hash_lookup (flagsv, ID2SYM (rb_intern (\"%s\")))))\n"
-                (String.lowercase flag);
+                (String.lowercase_ascii flag);
               pr "    flags += %d;\n" n
           ) open_flags
         | AUnusedFlags -> ()
