@@ -1321,6 +1321,18 @@ new_lh_record_with_children(hive_h *h, hive_node_h *nodes, const char **names, s
   return offset;
 }
 
+void get_offset_and_hash(hive_h *h, size_t index, struct ntreg_lf_record *old_lf,
+			 struct ntreg_ri_record *old_li, size_t *offset, char *hash){
+  if (old_lf) {
+    *offset = old_lf->keys[index].offset + 0x1000;
+    hash = old_lf->keys[index].hash;
+  } else { //old_li
+    *offset = old_li->offset[index] + 0x1000;
+    const char *old_name = hivex_node_name (h, *offset);
+    calc_hash("lh", old_name, &hash);
+  }
+}
+
 static size_t
 _fresh_lh_block(hive_h *h, size_t old_offs, const char** names, size_t *nkoffsets,
 		size_t start_pos, size_t end_pos)
@@ -1339,7 +1351,7 @@ _fresh_lh_block(hive_h *h, size_t old_offs, const char** names, size_t *nkoffset
     nr_keys = le16toh (old_li->nr_offsets);
   }
   size_t total_keys = nr_keys + keys_to_add;
-  DEBUG(2, "Exisitng keys %zu, adding %zu new keys", nr_keys, total_keys);
+  DEBUG(2, "Existing keys %zu, adding %zu new keys", nr_keys, keys_to_add);
   if (total_keys >= UINT16_MAX) {
     SET_ERRNO(EOVERFLOW,
 	      "cannot create a new record because it would contain more than maximum subkeys (%zu)",
@@ -1357,17 +1369,11 @@ _fresh_lh_block(hive_h *h, size_t old_offs, const char** names, size_t *nkoffset
   size_t old_key_index = 0; //iterator for old lf keys
   hive_node_h old_offset = 0;
   char *old_hash = malloc(sizeof(char) * 4);
-  if (old_lf) {
-    old_offset = old_lf->keys[old_key_index].offset;
-    old_hash = old_lf->keys[old_key_index].hash;
-  } else { //old_li
-    old_offset = old_li->offset[old_key_index];
-    const char *old_name = hivex_node_name (h, old_offset);
-    calc_hash("lh", old_name, &old_hash);
-  }
-
+  get_offset_and_hash(h, old_key_index, old_lf, old_li, &old_offset, old_hash);
   for(int pos=0; pos<total_keys; pos++){
-    if (compare_name_with_nk_name(h, names[new_key_index], old_offset) ||
+    // If we have new keys, and they come before the old key name or there are no more old keys
+    if (new_key_index < keys_to_add &&
+	compare_name_with_nk_name(h, names[new_key_index], old_offset) < 0 ||
 	old_key_index >= nr_keys) {
       DEBUG(2, "Inserting new node: 0x%zx in position: %u", nkoffsets[new_key_index], pos);
       lh->keys[pos].offset = htole32 (nkoffsets[new_key_index] - 0x1000);
@@ -1375,16 +1381,11 @@ _fresh_lh_block(hive_h *h, size_t old_offs, const char** names, size_t *nkoffset
       new_key_index++;
     } else {
       DEBUG(2, "Inserting old node: 0x%zx in position: %u", old_offset, pos);
-      lh->keys[pos].offset = old_offset;
+      lh->keys[pos].offset = old_offset - 0x1000;
       memcpy(lh->keys[pos].hash, old_hash, 4);
       old_key_index++;
-      if (old_lf) {
-	old_offset = old_lf->keys[old_key_index].offset;
-	old_hash = old_lf->keys[old_key_index].hash;
-      } else { //old_li
-	old_offset = old_li->offset[old_key_index];
-	const char *old_name = hivex_node_name (h, old_offset);
-	calc_hash("lh", old_name, &old_hash);
+      if (old_key_index < nr_keys) {
+	get_offset_and_hash(h, old_key_index, old_lf, old_li, &old_offset, old_hash);
       }
     }
   }
@@ -1400,7 +1401,7 @@ static int
 insert_subkeys(hive_h *h, size_t parent, size_t *nkoffsets,
 	       const char** names, int num_subkeys, size_t *blocks)
 {
-  size_t start_pos, end_pos = 0;
+  size_t start_pos = 0, end_pos = 0;
   hive_node_h last_offset = 0;
   size_t old_offs = 0, new_offs = 0;
 
@@ -1419,17 +1420,17 @@ insert_subkeys(hive_h *h, size_t parent, size_t *nkoffsets,
       old_lf = (struct ntreg_lf_record *) ((char *) h->addr + old_offs);
       old_li = NULL;
       num_keys = le16toh(old_lf->nr_keys);
-      last_offset = old_lf->keys[num_keys-1].offset;
+      last_offset = old_lf->keys[num_keys-1].offset + 0x1000;
     } else if (block_id_eq (h, blocks[i], "li")) {
       old_offs = blocks[i];
       old_li = (struct ntreg_ri_record *) ((char *) h->addr + old_offs);
       old_lf = NULL;
       num_keys = le16toh(old_li->nr_offsets);
-      last_offset = old_li->offset[num_keys-1];
+      last_offset = old_li->offset[num_keys-1] + 0x1000;
     }
     DEBUG(2, "Block has %u keys", num_keys);
     DEBUG(2, "Last offset of block is 0x%zx", last_offset);
-    last_name = hivex_node_name (h, old_offs);
+    last_name = hivex_node_name (h, last_offset);
     DEBUG(2, "Name of last block is %s", last_name);
     for (int j = start_pos; j < num_subkeys; j++){
       DEBUG(2, "Comparing with name %s", names[j]);
@@ -1493,10 +1494,10 @@ insert_subkeys(hive_h *h, size_t parent, size_t *nkoffsets,
 	    }
 	}
       }
+      /* Not found ..  This is an internal error. */
+      SET_ERRNO (ENOTSUP, "could not find ri->lf link");
+      return -1;
     }
-    /* Not found ..  This is an internal error. */
-    SET_ERRNO (ENOTSUP, "could not find ri->lf link");
-    return -1;
     found_it:;
   }
   return 0;
